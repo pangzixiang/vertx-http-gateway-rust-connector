@@ -1,0 +1,25 @@
+[package]
+name = "vertx-http-gateway-rust-connector"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio-tungstenite = "0.21.0"
+uuid = { version = "1", features = ["v4"] }
+#hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+#http-body-util = "0.1"
+#hyper-util = { version = "0.1", features = ["full"] }
+futures-channel = "0.3.30"
+reqwest = { version = "0.12", features = ["native-tls-vendored", "default", "stream"]}
+bytes = "1"
+futures-util = "0.3.30"
+
+[lib]
+crate-type = ["lib"]
+
+[[example]]
+name = "connector_test"
+crate-type = ["bin"]
