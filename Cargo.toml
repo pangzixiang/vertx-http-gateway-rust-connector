@@ -1,7 +1,15 @@
 [package]
 name = "vertx-http-gateway-rust-connector"
-version = "0.1.0"
+description = "Rust Implementation for Vertx Http Gateway Connector"
+keywords = ["http", "proxy"]
+homepage = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
+documentation = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
+readme = "README.md"
+repository = ""
+version = "0.0.1"
 edition = "2021"
+license = "Apache-2.0"
+authors = ["pangzixiang <313227220@qq.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
