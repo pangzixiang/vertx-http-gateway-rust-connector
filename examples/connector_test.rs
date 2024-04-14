@@ -2,6 +2,7 @@ use vertx_http_gateway_rust_connector::{ConnectorOptions, VertxHttpGatewayConnec
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let connector = VertxHttpGatewayConnector::new(ConnectorOptions {
         register_host: "localhost".to_string(),
         register_port: 9090,

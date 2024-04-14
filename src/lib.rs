@@ -5,6 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_channel::mpsc;
 use futures_util::{SinkExt, StreamExt};
+use log::{debug, info, trace};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Body, Method, StatusCode, Version};
 use tokio::sync::Mutex;
@@ -53,7 +54,7 @@ impl VertxHttpGatewayConnector {
 
     pub async fn start(&self) {
         let (ws_stream, _) = connect_async(&self.connection_url).await.expect(&format!("Failed to connect to {}", &self.connection_url));
-        println!("Connector succeeded to connect {}!", &self.connection_url);
+        info!("Connector succeeded to connect {}!", &self.connection_url);
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -63,9 +64,9 @@ impl VertxHttpGatewayConnector {
             while let Some(message) = ws_rx.next().await {
                 let b = message.unwrap();
                 if b == "ping".as_bytes().to_vec() {
-                    ws_write.send(Message::Ping(b)).await.expect("");
+                    ws_write.send(Message::Ping(b)).await.expect("Failed to send ping");
                 } else {
-                    ws_write.send(Message::Binary(b)).await.expect("TODO: panic message");
+                    ws_write.send(Message::Binary(b)).await.expect("Failed to send binary message to ws");
                 }
             }
         });
@@ -75,7 +76,7 @@ impl VertxHttpGatewayConnector {
             let mut interval = time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                println!("send ping to server");
+                trace!("send ping to gateway server");
                 ws_tx_ping.unbounded_send(Ok("ping".as_bytes().to_vec())).unwrap();
             }
         });
@@ -85,7 +86,7 @@ impl VertxHttpGatewayConnector {
         let request_in_progress = Arc::new(Mutex::new(HashMap::new()));
         
         let process_message_future = tokio::spawn(async move {
-            let client = reqwest::Client::builder().no_proxy().build().expect("should be able to build reqwest client");
+            let client = reqwest::Client::builder().no_proxy().build().expect("Failed to build reqwest client");
             let mut body_sender = None;
             while let Some(msg) = ws_read.next().await {
                 let msg = msg.unwrap();
@@ -93,19 +94,19 @@ impl VertxHttpGatewayConnector {
                 let request_in_progress_clone = Arc::clone(&request_in_progress);
                 if msg.is_close() {}
                 if msg.is_ping() {
-                    println!("receive ping from server");
+                    trace!("received ping from server");
                 }
                 if msg.is_text() {
-                    println!("receive text from server: {}", msg.clone().into_text().unwrap());
+                    trace!("received text from server: {}", msg.clone().into_text().unwrap());
                 }
                 if msg.is_pong() {
-                    println!("receive pong from server");
+                    trace!("received pong from server");
                 }
                 if msg.is_binary() {
                     let message_chunk = MessageChunk::new(msg.clone());
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[1] {
                         let request_message_info_chunk_body = RequestMessageInfoChunkBody::new(String::from_utf8(message_chunk.chunk_body.to_vec()).unwrap());
-                        println!("start to handle request for {} {}", request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
+                        info!("[{}] start to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
                         
                         request_in_progress_clone.lock().await.insert(message_chunk.request_id, true);
 
@@ -124,25 +125,25 @@ impl VertxHttpGatewayConnector {
                         }
 
                         tokio::spawn(async move {
-                            let response = request_builder.send().await.expect("should get response");
+                            let response = request_builder.send().await.expect("Failed to get response from downstream");
 
-                            println!("Response: {}", response.status());
+                            debug!("[{}] proxied response status: {}", message_chunk.request_id, response.status());
 
                             let response_message_info_chunk_body = build_response_info_chunk_body(response.headers(), response.version(), response.status());
                             let mut info_chunk_bytes: Vec<u8> = CHUNK_TYPE_VEC[1].to_be_bytes().to_vec();
                             info_chunk_bytes.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
                             info_chunk_bytes.append(&mut response_message_info_chunk_body.clone());
-                            ws_tx_clone.unbounded_send(Ok(info_chunk_bytes)).expect("should send first info response chunk");
+                            ws_tx_clone.unbounded_send(Ok(info_chunk_bytes)).expect("failed to send first info response chunk");
 
                             let mut stream = response.bytes_stream();
 
                             while let Some(b) = stream.next().await {
-                                if let Some(is_in_progress) = request_in_progress_clone.lock().await.get(&message_chunk.request_id) {
+                                if let Some(_) = request_in_progress_clone.lock().await.get(&message_chunk.request_id) {
                                     let mut body_buffer = CHUNK_TYPE_VEC[2].to_be_bytes().to_vec();
                                     body_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
                                     body_buffer.append(&mut b.unwrap().to_vec());
-                                    println!("Response body: {:?}", body_buffer);
-                                    ws_tx_clone.unbounded_send(Ok(body_buffer)).expect("should send response body chunk");
+                                    trace!("[{}] received proxied response body chunk: {:?}", message_chunk.request_id, body_buffer);
+                                    ws_tx_clone.unbounded_send(Ok(body_buffer)).expect("failed to send response body chunk to upstream");
                                 } else { 
                                     break;
                                 }
@@ -150,29 +151,29 @@ impl VertxHttpGatewayConnector {
 
                             let mut end_buffer = CHUNK_TYPE_VEC[3].to_be_bytes().to_vec();
                             end_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
-                            ws_tx_clone.unbounded_send(Ok(end_buffer)).expect("should send response body end chunk");
+                            ws_tx_clone.unbounded_send(Ok(end_buffer)).expect("failed to send response body end chunk to upstream");
 
-                            println!("proxy done");
+                            info!("[{}] succeeded to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
                         });
                     }
 
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[2] {
-                        println!("received request body chunk: {:?}", message_chunk.chunk_body);
+                        debug!("[{}] received request body chunk from upstream: {:?}", message_chunk.request_id ,message_chunk.chunk_body);
                         if let Some(sender) = body_sender.clone() {
-                            sender.unbounded_send(Ok(message_chunk.chunk_body)).expect("should send request body chunk");
+                            sender.unbounded_send(Ok(message_chunk.chunk_body)).expect("failed to send request body chunk to downstream");
                         }
                     }
 
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[3] {
-                        println!("received request end notification");
+                        debug!("[{}] received request end notification from upstream", message_chunk.request_id);
                         if let Some(sender) = body_sender.clone() {
-                            println!("send body end notification");
+                            trace!("[{}] send body end notification to downstream", message_chunk.request_id);
                             sender.close_channel();
                         }
                     }
                     let request_in_progress_clone = Arc::clone(&request_in_progress);
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[4] {
-                        println!("received connection closed notification");
+                        debug!("[{}] received connection closed notification from upstream", message_chunk.request_id);
                         request_in_progress_clone.lock().await.remove(&message_chunk.request_id);
                     }
                 }
@@ -181,13 +182,13 @@ impl VertxHttpGatewayConnector {
 
         tokio::select! {
             _ = process_message_future => {
-                println!("Process Message Future ended!")
+                info!("Process Message Future ended!")
             },
             _ = ws_future => {
-                println!("WS message handler ended!")
+                info!("WS message handler ended!")
             },
             _ = ping_future => {
-                println!("Ping handler ended!")
+                info!("Ping handler ended!")
             }
         }
     }
