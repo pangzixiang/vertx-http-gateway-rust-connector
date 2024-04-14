@@ -5,10 +5,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_channel::mpsc;
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, info, trace};
+use log::{debug, error, info, trace};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Body, Method, StatusCode, Version};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 use tokio::time;
 use tokio_tungstenite::connect_async;
@@ -26,35 +27,45 @@ pub struct VertxHttpGatewayConnector {
     connection_url: String,
     service_host: String,
     service_port: u16,
+    instance: u8,
 }
 
 pub struct ConnectorOptions {
     pub register_host: String,
     pub register_port: u16,
-    pub service_host: String,
+    pub service_host: Option<String>,
     pub service_name: String,
     pub service_port: u16,
     pub register_path: String,
+    pub instance: Option<u8>,
 }
 
 impl VertxHttpGatewayConnector {
     pub fn new(options: ConnectorOptions) -> VertxHttpGatewayConnector {
         VertxHttpGatewayConnector {
-            connection_url: format!("ws://{}:{}{}?serviceName={}&servicePort={}&instance={}",
+            connection_url: format!("ws://{}:{}{}?serviceName={}&servicePort={}",
                                     options.register_host,
                                     options.register_port,
                                     options.register_path,
                                     options.service_name,
-                                    options.service_port,
-                                    uuid::Uuid::new_v4().to_string()),
-            service_host: options.service_host,
+                                    options.service_port),
+            service_host: options.service_host.unwrap_or_else(|| "localhost".to_string()),
             service_port: options.service_port,
+            instance: options.instance.unwrap_or_else(|| 2u8)
         }
     }
-
-    pub async fn start(&self) {
-        let (ws_stream, _) = connect_async(&self.connection_url).await.expect(&format!("Failed to connect to {}", &self.connection_url));
-        info!("Connector succeeded to connect {}!", &self.connection_url);
+    
+    async fn connect(connection_url: String, service_host: String, service_port: u16) -> Result<(), String> {
+        let url = connection_url.clone();
+        info!("Connector start to connect to {}", url);
+        let ws_connect_result = connect_async(connection_url).await;
+        
+        if let Err(e) = ws_connect_result {
+            let err = format!("Failed to connect to {} due to {}", url, e.to_string());
+            return Err(err);
+        }
+        let (ws_stream, _) = ws_connect_result.unwrap();
+        info!("Connector succeeded to connect {}!", url);
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -64,7 +75,7 @@ impl VertxHttpGatewayConnector {
             while let Some(message) = ws_rx.next().await {
                 let b = message.unwrap();
                 if b == "ping".as_bytes().to_vec() {
-                    ws_write.send(Message::Ping(b)).await.expect("Failed to send ping");
+                    ws_write.send(Message::Ping(b)).await.expect("Failed to send ping to ws");
                 } else {
                     ws_write.send(Message::Binary(b)).await.expect("Failed to send binary message to ws");
                 }
@@ -77,19 +88,16 @@ impl VertxHttpGatewayConnector {
             loop {
                 interval.tick().await;
                 trace!("send ping to gateway server");
-                ws_tx_ping.unbounded_send(Ok("ping".as_bytes().to_vec())).unwrap();
+                ws_tx_ping.unbounded_send(Ok("ping".as_bytes().to_vec())).expect("Failed to send ping to ws_tx channel");
             }
         });
-
-        let service_host = self.service_host.clone();
-        let service_port = self.service_port.clone();
         let request_in_progress = Arc::new(Mutex::new(HashMap::new()));
-        
+
         let process_message_future = tokio::spawn(async move {
             let client = reqwest::Client::builder().no_proxy().build().expect("Failed to build reqwest client");
             let mut body_sender = None;
             while let Some(msg) = ws_read.next().await {
-                let msg = msg.unwrap();
+                let msg = msg.expect("Failed to receive message from gateway server");
                 let ws_tx_clone = ws_tx.clone();
                 let request_in_progress_clone = Arc::clone(&request_in_progress);
                 if msg.is_close() {}
@@ -107,7 +115,7 @@ impl VertxHttpGatewayConnector {
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[1] {
                         let request_message_info_chunk_body = RequestMessageInfoChunkBody::new(String::from_utf8(message_chunk.chunk_body.to_vec()).unwrap());
                         info!("[{}] start to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
-                        
+
                         request_in_progress_clone.lock().await.insert(message_chunk.request_id, true);
 
                         let mut request_builder = client.request(
@@ -144,7 +152,7 @@ impl VertxHttpGatewayConnector {
                                     body_buffer.append(&mut b.unwrap().to_vec());
                                     trace!("[{}] received proxied response body chunk: {:?}", message_chunk.request_id, body_buffer);
                                     ws_tx_clone.unbounded_send(Ok(body_buffer)).expect("failed to send response body chunk to upstream");
-                                } else { 
+                                } else {
                                     break;
                                 }
                             }
@@ -182,13 +190,35 @@ impl VertxHttpGatewayConnector {
 
         tokio::select! {
             _ = process_message_future => {
-                info!("Process Message Future ended!")
+                error!("Process Message Future ended!");
+                Err(String::from("Connector message processor stopped unexpectedly!"))
             },
             _ = ws_future => {
-                info!("WS message handler ended!")
+                error!("Websocket message handler ended!");
+                Err(String::from("Websocket message handler stopped unexpectedly!"))
             },
             _ = ping_future => {
-                info!("Ping handler ended!")
+                error!("Ping handler ended!");
+                Err(String::from("Websocket ping handler stopped unexpectedly!"))
+            }
+        }
+    }
+
+    pub async fn start(&self) {
+        loop {
+            let service_port = self.service_port.clone();
+            let instance = self.instance.clone();
+            let mut set = JoinSet::new();
+            for _ in 0..instance {
+                let connection_url = self.connection_url.clone();
+                let service_host = self.service_host.clone();
+                set.spawn(Self::connect(format!("{}&instance={}", connection_url, uuid::Uuid::new_v4().to_string()), service_host, service_port));
+            }
+            while let Some(res) = set.join_next().await {
+                if let Err(e) = res.unwrap() {
+                    error!("Connection failed: {}, Connector will retry connection...", e.to_string());
+                    break;
+                }
             }
         }
     }

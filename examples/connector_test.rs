@@ -6,11 +6,12 @@ async fn main() {
     let connector = VertxHttpGatewayConnector::new(ConnectorOptions {
         register_host: "localhost".to_string(),
         register_port: 9090,
-        service_host: "localhost".to_string(),
+        service_host: None,
         service_name: "test-service".to_string(),
         service_port: 12345,
         register_path: "/register".to_string(),
+        instance: None
     });
-    
+
     connector.start().await;
 }
