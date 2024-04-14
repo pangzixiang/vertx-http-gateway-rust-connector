@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 use bytes::Bytes;
 use futures_channel::mpsc;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Body, Method, StatusCode, Version};
+use tokio::sync::Mutex;
 
 use tokio::time;
 use tokio_tungstenite::connect_async;
@@ -79,13 +82,15 @@ impl VertxHttpGatewayConnector {
 
         let service_host = self.service_host.clone();
         let service_port = self.service_port.clone();
-
+        let request_in_progress = Arc::new(Mutex::new(HashMap::new()));
+        
         let process_message_future = tokio::spawn(async move {
             let client = reqwest::Client::builder().no_proxy().build().expect("should be able to build reqwest client");
             let mut body_sender = None;
             while let Some(msg) = ws_read.next().await {
                 let msg = msg.unwrap();
                 let ws_tx_clone = ws_tx.clone();
+                let request_in_progress_clone = Arc::clone(&request_in_progress);
                 if msg.is_close() {}
                 if msg.is_ping() {
                     println!("receive ping from server");
@@ -101,6 +106,8 @@ impl VertxHttpGatewayConnector {
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[1] {
                         let request_message_info_chunk_body = RequestMessageInfoChunkBody::new(String::from_utf8(message_chunk.chunk_body.to_vec()).unwrap());
                         println!("start to handle request for {} {}", request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
+                        
+                        request_in_progress_clone.lock().await.insert(message_chunk.request_id, true);
 
                         let mut request_builder = client.request(
                             Method::from_bytes(request_message_info_chunk_body.http_method.as_bytes()).expect(&format!("unable to parse request method {}", request_message_info_chunk_body.http_method)),
@@ -115,7 +122,7 @@ impl VertxHttpGatewayConnector {
                             body_sender = Some(sender);
                             request_builder = request_builder.body(Body::wrap_stream(recv));
                         }
-                        
+
                         tokio::spawn(async move {
                             let response = request_builder.send().await.expect("should get response");
 
@@ -128,13 +135,17 @@ impl VertxHttpGatewayConnector {
                             ws_tx_clone.unbounded_send(Ok(info_chunk_bytes)).expect("should send first info response chunk");
 
                             let mut stream = response.bytes_stream();
-                            
+
                             while let Some(b) = stream.next().await {
-                                let mut body_buffer = CHUNK_TYPE_VEC[2].to_be_bytes().to_vec();
-                                body_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
-                                body_buffer.append(&mut b.unwrap().to_vec());
-                                println!("Response body: {:?}", body_buffer);
-                                ws_tx_clone.unbounded_send(Ok(body_buffer)).expect("should send response body chunk");
+                                if let Some(is_in_progress) = request_in_progress_clone.lock().await.get(&message_chunk.request_id) {
+                                    let mut body_buffer = CHUNK_TYPE_VEC[2].to_be_bytes().to_vec();
+                                    body_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
+                                    body_buffer.append(&mut b.unwrap().to_vec());
+                                    println!("Response body: {:?}", body_buffer);
+                                    ws_tx_clone.unbounded_send(Ok(body_buffer)).expect("should send response body chunk");
+                                } else { 
+                                    break;
+                                }
                             }
 
                             let mut end_buffer = CHUNK_TYPE_VEC[3].to_be_bytes().to_vec();
@@ -154,14 +165,15 @@ impl VertxHttpGatewayConnector {
 
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[3] {
                         println!("received request end notification");
-                        if let Some(sender) = body_sender.clone() { 
+                        if let Some(sender) = body_sender.clone() {
                             println!("send body end notification");
                             sender.close_channel();
                         }
                     }
-
+                    let request_in_progress_clone = Arc::clone(&request_in_progress);
                     if message_chunk.chunk_type == CHUNK_TYPE_VEC[4] {
                         println!("received connection closed notification");
+                        request_in_progress_clone.lock().await.remove(&message_chunk.request_id);
                     }
                 }
             }
@@ -182,7 +194,7 @@ impl VertxHttpGatewayConnector {
 }
 
 fn build_response_info_chunk_body(header_map: &HeaderMap<HeaderValue>, http_version: Version, status_code: StatusCode) -> Vec<u8> {
-    let version = match http_version { 
+    let version = match http_version {
         Version::HTTP_11 => "http/1.1",
         Version::HTTP_2 => "h2",
         _ => panic!("not support http version {:?}", http_version)
