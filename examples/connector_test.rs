@@ -1,17 +1,16 @@
-use vertx_http_gateway_rust_connector::{ConnectorOptions, VertxHttpGatewayConnector};
+use std::env::set_var;
+use reqwest::Client;
+use vertx_http_gateway_rust_connector::{VertxHttpGatewayConnector};
 
 #[tokio::main]
 async fn main() {
+    set_var("RUST_LOG", "debug");
     env_logger::init();
-    let connector = VertxHttpGatewayConnector::new(ConnectorOptions {
-        register_host: "localhost".to_string(),
-        register_port: 9090,
-        service_host: None,
-        service_name: "test-service".to_string(),
-        service_port: 12345,
-        register_path: "/register".to_string(),
-        instance: None
-    });
+    let connector = VertxHttpGatewayConnector::builder(9090, "test-service".to_string(), 12345, "/register".to_string())
+        .with_service_ssl(true)
+        .with_service_host("localhost".to_string())
+        .with_proxy_client(Client::builder().use_native_tls().connection_verbose(true).danger_accept_invalid_hostnames(true).build().unwrap())
+        .build();
 
     connector.start().await;
 }

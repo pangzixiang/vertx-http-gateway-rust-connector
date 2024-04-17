@@ -6,7 +6,7 @@ homepage = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
 documentation = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
 readme = "README.md"
 repository = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["pangzixiang <313227220@qq.com>"]
@@ -18,7 +18,7 @@ tokio-tungstenite = "0.21.0"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
 futures-channel = "0.3.30"
-reqwest = { version = "0.12", features = ["native-tls-vendored", "default", "stream"]}
+reqwest = { version = "0.12", features = ["default-tls", "native-tls", "rustls-tls", "stream"]}
 bytes = "1"
 futures-util = "0.3.30"
 log = "0.4.21"

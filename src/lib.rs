@@ -7,7 +7,7 @@ use futures_channel::mpsc;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, trace};
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{Body, Method, StatusCode, Version};
+use reqwest::{Body, Client, Method, StatusCode, Version};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
@@ -28,38 +28,95 @@ pub struct VertxHttpGatewayConnector {
     service_host: String,
     service_port: u16,
     instance: u8,
+    proxy_client: Client,
+    service_ssl: bool,
 }
 
-pub struct ConnectorOptions {
-    pub register_host: String,
-    pub register_port: u16,
-    pub service_host: Option<String>,
-    pub service_name: String,
-    pub service_port: u16,
-    pub register_path: String,
-    pub instance: Option<u8>,
+struct ConnectorOptions {
+    register_host: String,
+    register_port: u16,
+    service_host: String,
+    service_name: String,
+    service_port: u16,
+    service_ssl: bool,
+    register_path: String,
+    instance: u8,
+    proxy_client: Client,
 }
 
-impl VertxHttpGatewayConnector {
-    pub fn new(options: ConnectorOptions) -> VertxHttpGatewayConnector {
-        VertxHttpGatewayConnector {
-            connection_url: format!("ws://{}:{}{}?serviceName={}&servicePort={}",
-                                    options.register_host,
-                                    options.register_port,
-                                    options.register_path,
-                                    options.service_name,
-                                    options.service_port),
-            service_host: options.service_host.unwrap_or_else(|| "localhost".to_string()),
-            service_port: options.service_port,
-            instance: options.instance.unwrap_or_else(|| 2u8)
+pub struct ConnectorOptionsBuilder {
+    options: ConnectorOptions,
+}
+
+impl ConnectorOptionsBuilder {
+    pub fn new(register_port: u16, service_name: String, service_port: u16, register_path: String) -> ConnectorOptionsBuilder {
+        ConnectorOptionsBuilder {
+            options: ConnectorOptions {
+                register_host: "localhost".to_string(),
+                register_port,
+                service_host: "localhost".to_string(),
+                service_name,
+                service_port,
+                service_ssl: false,
+                register_path,
+                instance: 2,
+                proxy_client: Client::builder().build().expect("Failed to build reqwest client")
+            }
         }
     }
     
-    async fn connect(connection_url: String, service_host: String, service_port: u16) -> Result<(), String> {
+    pub fn with_register_host(mut self, register_host: String) -> ConnectorOptionsBuilder {
+        self.options.register_host = register_host;
+        self
+    }
+    
+    pub fn with_service_host(mut self, service_host: String) -> ConnectorOptionsBuilder {
+        self.options.service_host = service_host;
+        self
+    }
+    
+    pub fn with_service_ssl(mut self, service_ssl: bool) -> ConnectorOptionsBuilder {
+        self.options.service_ssl = service_ssl;
+        self
+    }
+    
+    pub fn with_instance(mut self, instance: u8) -> ConnectorOptionsBuilder {
+        self.options.instance = instance;
+        self
+    }
+    
+    pub fn with_proxy_client(mut self, proxy_client: Client) -> ConnectorOptionsBuilder {
+        self.options.proxy_client = proxy_client;
+        self
+    }
+    
+    pub fn build(self) -> VertxHttpGatewayConnector {
+        VertxHttpGatewayConnector {
+            connection_url: format!("ws://{}:{}{}?serviceName={}&servicePort={}",
+                                    self.options.register_host,
+                                    self.options.register_port,
+                                    self.options.register_path,
+                                    self.options.service_name,
+                                    self.options.service_port),
+            service_host: self.options.service_host,
+            service_port: self.options.service_port,
+            service_ssl: self.options.service_ssl,
+            instance: self.options.instance,
+            proxy_client: self.options.proxy_client
+        }
+    }
+}
+
+impl VertxHttpGatewayConnector {
+    pub fn builder(register_port: u16, service_name: String, service_port: u16, register_path: String) -> ConnectorOptionsBuilder {
+        ConnectorOptionsBuilder::new(register_port, service_name, service_port, register_path)
+    }
+
+    async fn connect(proxy_client: Client, connection_url: String, service_host: String, service_port: u16, service_ssl: bool) -> Result<(), String> {
         let url = connection_url.clone();
         info!("Connector start to connect to {}", url);
         let ws_connect_result = connect_async(connection_url).await;
-        
+
         if let Err(e) = ws_connect_result {
             let err = format!("Failed to connect to {} due to {}", url, e.to_string());
             return Err(err);
@@ -94,7 +151,6 @@ impl VertxHttpGatewayConnector {
         let request_in_progress = Arc::new(Mutex::new(HashMap::new()));
 
         let process_message_future = tokio::spawn(async move {
-            let client = reqwest::Client::builder().no_proxy().build().expect("Failed to build reqwest client");
             let mut body_sender = None;
             while let Some(msg) = ws_read.next().await {
                 let msg = msg.expect("Failed to receive message from gateway server");
@@ -117,10 +173,15 @@ impl VertxHttpGatewayConnector {
                         info!("[{}] start to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
 
                         request_in_progress_clone.lock().await.insert(message_chunk.request_id, true);
+                        
+                        let url_prefix = match service_ssl { 
+                            true => "https://",
+                            false => "http://"
+                        };
 
-                        let mut request_builder = client.request(
+                        let mut request_builder = proxy_client.request(
                             Method::from_bytes(request_message_info_chunk_body.http_method.as_bytes()).expect(&format!("unable to parse request method {}", request_message_info_chunk_body.http_method)),
-                            format!("http://{}:{}{}", service_host, service_port, request_message_info_chunk_body.uri));
+                            format!("{}{}:{}{}", url_prefix, service_host, service_port, request_message_info_chunk_body.uri));
 
                         for (key, value) in request_message_info_chunk_body.headers {
                             request_builder = request_builder.header(key, value);
@@ -133,35 +194,45 @@ impl VertxHttpGatewayConnector {
                         }
 
                         tokio::spawn(async move {
-                            let response = request_builder.send().await.expect("Failed to get response from downstream");
+                            let response_result = request_builder.send().await;
+                            
+                            if let Err(e) = response_result {
+                                let mut end_buffer = CHUNK_TYPE_VEC[0].to_be_bytes().to_vec();
+                                end_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
+                                end_buffer.append(&mut e.to_string().into_bytes());
+                                ws_tx_clone.unbounded_send(Ok(end_buffer)).expect("failed to send response body end chunk to upstream");
+                                info!("[{}] failed to handle proxy for {} {} due to {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri, e);
+                            } else {
+                                let response = response_result.unwrap();
 
-                            debug!("[{}] proxied response status: {}", message_chunk.request_id, response.status());
+                                debug!("[{}] proxied response status: {}", message_chunk.request_id, response.status());
 
-                            let response_message_info_chunk_body = build_response_info_chunk_body(response.headers(), response.version(), response.status());
-                            let mut info_chunk_bytes: Vec<u8> = CHUNK_TYPE_VEC[1].to_be_bytes().to_vec();
-                            info_chunk_bytes.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
-                            info_chunk_bytes.append(&mut response_message_info_chunk_body.clone());
-                            ws_tx_clone.unbounded_send(Ok(info_chunk_bytes)).expect("failed to send first info response chunk");
+                                let response_message_info_chunk_body = build_response_info_chunk_body(response.headers(), response.version(), response.status());
+                                let mut info_chunk_bytes: Vec<u8> = CHUNK_TYPE_VEC[1].to_be_bytes().to_vec();
+                                info_chunk_bytes.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
+                                info_chunk_bytes.append(&mut response_message_info_chunk_body.clone());
+                                ws_tx_clone.unbounded_send(Ok(info_chunk_bytes)).expect("failed to send first info response chunk");
 
-                            let mut stream = response.bytes_stream();
+                                let mut stream = response.bytes_stream();
 
-                            while let Some(b) = stream.next().await {
-                                if let Some(_) = request_in_progress_clone.lock().await.get(&message_chunk.request_id) {
-                                    let mut body_buffer = CHUNK_TYPE_VEC[2].to_be_bytes().to_vec();
-                                    body_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
-                                    body_buffer.append(&mut b.unwrap().to_vec());
-                                    trace!("[{}] received proxied response body chunk: {:?}", message_chunk.request_id, body_buffer);
-                                    ws_tx_clone.unbounded_send(Ok(body_buffer)).expect("failed to send response body chunk to upstream");
-                                } else {
-                                    break;
+                                while let Some(b) = stream.next().await {
+                                    if let Some(_) = request_in_progress_clone.lock().await.get(&message_chunk.request_id) {
+                                        let mut body_buffer = CHUNK_TYPE_VEC[2].to_be_bytes().to_vec();
+                                        body_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
+                                        body_buffer.append(&mut b.unwrap().to_vec());
+                                        trace!("[{}] received proxied response body chunk: {:?}", message_chunk.request_id, body_buffer);
+                                        ws_tx_clone.unbounded_send(Ok(body_buffer)).expect("failed to send response body chunk to upstream");
+                                    } else {
+                                        break;
+                                    }
                                 }
+
+                                let mut end_buffer = CHUNK_TYPE_VEC[3].to_be_bytes().to_vec();
+                                end_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
+                                ws_tx_clone.unbounded_send(Ok(end_buffer)).expect("failed to send response body end chunk to upstream");
+
+                                info!("[{}] succeeded to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);   
                             }
-
-                            let mut end_buffer = CHUNK_TYPE_VEC[3].to_be_bytes().to_vec();
-                            end_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
-                            ws_tx_clone.unbounded_send(Ok(end_buffer)).expect("failed to send response body end chunk to upstream");
-
-                            info!("[{}] succeeded to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
                         });
                     }
 
@@ -208,11 +279,13 @@ impl VertxHttpGatewayConnector {
         loop {
             let service_port = self.service_port.clone();
             let instance = self.instance.clone();
+            let service_ssl = self.service_ssl.clone();
             let mut set = JoinSet::new();
             for _ in 0..instance {
+                let proxy_client = self.proxy_client.clone();
                 let connection_url = self.connection_url.clone();
                 let service_host = self.service_host.clone();
-                set.spawn(Self::connect(format!("{}&instance={}", connection_url, uuid::Uuid::new_v4().to_string()), service_host, service_port));
+                set.spawn(Self::connect(proxy_client, format!("{}&instance={}", connection_url, uuid::Uuid::new_v4().to_string()), service_host, service_port, service_ssl));
             }
             while let Some(res) = set.join_next().await {
                 if let Err(e) = res.unwrap() {
