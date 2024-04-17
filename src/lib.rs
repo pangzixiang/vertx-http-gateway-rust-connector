@@ -42,7 +42,6 @@ pub struct VertxHttpGatewayConnector {
 struct ConnectorOptions {
     register_host: String,
     register_port: u16,
-    register_ssl: bool,
     register_tls_connector: Option<Connector>,
     service_host: String,
     service_name: String,
@@ -63,7 +62,6 @@ impl ConnectorOptionsBuilder {
             options: ConnectorOptions {
                 register_host: "localhost".to_string(),
                 register_port,
-                register_ssl: false,
                 register_tls_connector: None,
                 service_host: "localhost".to_string(),
                 service_name,
@@ -75,49 +73,44 @@ impl ConnectorOptionsBuilder {
             }
         }
     }
-    
+
     pub fn with_register_host(mut self, register_host: String) -> ConnectorOptionsBuilder {
         self.options.register_host = register_host;
         self
     }
-    
+
     pub fn with_service_host(mut self, service_host: String) -> ConnectorOptionsBuilder {
         self.options.service_host = service_host;
         self
     }
-    
+
     pub fn with_service_ssl(mut self, service_ssl: bool) -> ConnectorOptionsBuilder {
         self.options.service_ssl = service_ssl;
         self
     }
-    
+
     pub fn with_instance(mut self, instance: u8) -> ConnectorOptionsBuilder {
         self.options.instance = instance;
         self
     }
-    
-    pub fn with_register_ssl(mut self, register_ssl: bool) -> ConnectorOptionsBuilder {
-        self.options.register_ssl = register_ssl;
-        self
-    }
-    
+
     pub fn with_register_tls_connector(mut self, register_tls_connector: Connector) -> ConnectorOptionsBuilder {
         self.options.register_tls_connector = Option::from(register_tls_connector);
         self
     }
-    
+
     pub fn with_proxy_client(mut self, proxy_client: Client) -> ConnectorOptionsBuilder {
         self.options.proxy_client = proxy_client;
         self
     }
-    
+
     pub fn build(self) -> VertxHttpGatewayConnector {
         VertxHttpGatewayConnector {
             register_host: self.options.register_host,
             register_port: self.options.register_port,
             register_path: self.options.register_path,
+            register_ssl: self.options.register_tls_connector.is_some(),
             register_tls_connector: self.options.register_tls_connector,
-            register_ssl: self.options.register_ssl,
             service_host: self.options.service_host,
             service_port: self.options.service_port,
             service_name: self.options.service_name,
@@ -195,8 +188,8 @@ impl VertxHttpGatewayConnector {
                         info!("[{}] start to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
 
                         request_in_progress_clone.lock().await.insert(message_chunk.request_id, true);
-                        
-                        let url_prefix = match service_ssl { 
+
+                        let url_prefix = match service_ssl {
                             true => "https://",
                             false => "http://"
                         };
@@ -217,7 +210,7 @@ impl VertxHttpGatewayConnector {
 
                         tokio::spawn(async move {
                             let response_result = request_builder.send().await;
-                            
+
                             if let Err(e) = response_result {
                                 let mut end_buffer = CHUNK_TYPE_VEC[0].to_be_bytes().to_vec();
                                 end_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
@@ -253,7 +246,7 @@ impl VertxHttpGatewayConnector {
                                 end_buffer.append(&mut message_chunk.request_id.clone().to_be_bytes().to_vec());
                                 ws_tx_clone.unbounded_send(Ok(end_buffer)).expect("failed to send response body end chunk to upstream");
 
-                                info!("[{}] succeeded to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);   
+                                info!("[{}] succeeded to handle proxy for {} {}", message_chunk.request_id ,request_message_info_chunk_body.http_method, request_message_info_chunk_body.uri);
                             }
                         });
                     }
@@ -298,6 +291,7 @@ impl VertxHttpGatewayConnector {
     }
 
     pub async fn start(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             let service_port = self.service_port.clone();
             let register_host = self.register_host.clone();
@@ -305,7 +299,7 @@ impl VertxHttpGatewayConnector {
             let instance = self.instance.clone();
             let service_ssl = self.service_ssl.clone();
             let mut set = JoinSet::new();
-            let ws_url_prefix = match self.register_ssl { 
+            let ws_url_prefix = match self.register_ssl {
                 true => "wss://",
                 false => "ws://"
             };
@@ -320,6 +314,7 @@ impl VertxHttpGatewayConnector {
             while let Some(res) = set.join_next().await {
                 if let Err(e) = res.unwrap() {
                     error!("Connection failed: {}, Connector will retry connection...", e.to_string());
+                    interval.tick().await;
                     break;
                 }
             }
