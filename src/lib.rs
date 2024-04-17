@@ -8,12 +8,14 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, trace};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Body, Client, Method, StatusCode, Version};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use tokio::time;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{client_async_tls_with_config};
+use tokio_tungstenite::tungstenite::{Message};
+use tokio_tungstenite::Connector;
 
 use crate::message_chunk::MessageChunk;
 use crate::request_message_info_chunk_body::RequestMessageInfoChunkBody;
@@ -24,7 +26,12 @@ mod request_message_info_chunk_body;
 const CHUNK_TYPE_VEC: [i8; 5] = [-2, 0, 1, 2, 3];
 
 pub struct VertxHttpGatewayConnector {
-    connection_url: String,
+    register_host: String,
+    register_port: u16,
+    register_path: String,
+    register_ssl: bool,
+    register_tls_connector: Option<Connector>,
+    service_name: String,
     service_host: String,
     service_port: u16,
     instance: u8,
@@ -35,6 +42,8 @@ pub struct VertxHttpGatewayConnector {
 struct ConnectorOptions {
     register_host: String,
     register_port: u16,
+    register_ssl: bool,
+    register_tls_connector: Option<Connector>,
     service_host: String,
     service_name: String,
     service_port: u16,
@@ -54,6 +63,8 @@ impl ConnectorOptionsBuilder {
             options: ConnectorOptions {
                 register_host: "localhost".to_string(),
                 register_port,
+                register_ssl: false,
+                register_tls_connector: None,
                 service_host: "localhost".to_string(),
                 service_name,
                 service_port,
@@ -85,6 +96,16 @@ impl ConnectorOptionsBuilder {
         self
     }
     
+    pub fn with_register_ssl(mut self, register_ssl: bool) -> ConnectorOptionsBuilder {
+        self.options.register_ssl = register_ssl;
+        self
+    }
+    
+    pub fn with_register_tls_connector(mut self, register_tls_connector: Connector) -> ConnectorOptionsBuilder {
+        self.options.register_tls_connector = Option::from(register_tls_connector);
+        self
+    }
+    
     pub fn with_proxy_client(mut self, proxy_client: Client) -> ConnectorOptionsBuilder {
         self.options.proxy_client = proxy_client;
         self
@@ -92,14 +113,14 @@ impl ConnectorOptionsBuilder {
     
     pub fn build(self) -> VertxHttpGatewayConnector {
         VertxHttpGatewayConnector {
-            connection_url: format!("ws://{}:{}{}?serviceName={}&servicePort={}",
-                                    self.options.register_host,
-                                    self.options.register_port,
-                                    self.options.register_path,
-                                    self.options.service_name,
-                                    self.options.service_port),
+            register_host: self.options.register_host,
+            register_port: self.options.register_port,
+            register_path: self.options.register_path,
+            register_tls_connector: self.options.register_tls_connector,
+            register_ssl: self.options.register_ssl,
             service_host: self.options.service_host,
             service_port: self.options.service_port,
+            service_name: self.options.service_name,
             service_ssl: self.options.service_ssl,
             instance: self.options.instance,
             proxy_client: self.options.proxy_client
@@ -112,10 +133,11 @@ impl VertxHttpGatewayConnector {
         ConnectorOptionsBuilder::new(register_port, service_name, service_port, register_path)
     }
 
-    async fn connect(proxy_client: Client, connection_url: String, service_host: String, service_port: u16, service_ssl: bool) -> Result<(), String> {
+    async fn connect(proxy_client: Client, connection_url: String, tcp_stream: TcpStream, register_tls_connector: Option<Connector>, service_host: String, service_port: u16, service_ssl: bool) -> Result<(), String> {
         let url = connection_url.clone();
         info!("Connector start to connect to {}", url);
-        let ws_connect_result = connect_async(connection_url).await;
+        let ws_connect_result = client_async_tls_with_config(connection_url, tcp_stream, None, register_tls_connector).await;
+        // let ws_connect_result = connect_async(connection_url).await;
 
         if let Err(e) = ws_connect_result {
             let err = format!("Failed to connect to {} due to {}", url, e.to_string());
@@ -278,14 +300,22 @@ impl VertxHttpGatewayConnector {
     pub async fn start(&self) {
         loop {
             let service_port = self.service_port.clone();
+            let register_host = self.register_host.clone();
+            let register_port = self.register_port.clone();
             let instance = self.instance.clone();
             let service_ssl = self.service_ssl.clone();
             let mut set = JoinSet::new();
+            let ws_url_prefix = match self.register_ssl { 
+                true => "wss://",
+                false => "ws://"
+            };
+            let connection_url = format!("{}{}:{}{}?serviceName={}&servicePort={}",ws_url_prefix, register_host, register_port, self.register_path, self.service_name, service_port);
             for _ in 0..instance {
                 let proxy_client = self.proxy_client.clone();
-                let connection_url = self.connection_url.clone();
                 let service_host = self.service_host.clone();
-                set.spawn(Self::connect(proxy_client, format!("{}&instance={}", connection_url, uuid::Uuid::new_v4().to_string()), service_host, service_port, service_ssl));
+                let connector = self.register_tls_connector.clone();
+                let tcp_stream = TcpStream::connect(format!("{}:{}", register_host, register_port)).await.expect("Failed to start tcp connection");
+                set.spawn(Self::connect(proxy_client, format!("{}&instance={}", connection_url, uuid::Uuid::new_v4().to_string()), tcp_stream, connector, service_host, service_port, service_ssl));
             }
             while let Some(res) = set.join_next().await {
                 if let Err(e) = res.unwrap() {
