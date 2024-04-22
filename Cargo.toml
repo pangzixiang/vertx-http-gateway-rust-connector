@@ -6,7 +6,7 @@ homepage = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
 documentation = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
 readme = "README.md"
 repository = "https://github.com/pangzixiang/vertx-http-gateway-rust-connector"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["pangzixiang <313227220@qq.com>"]
@@ -14,21 +14,18 @@ authors = ["pangzixiang <313227220@qq.com>"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio-tungstenite = { version = "0", features = ["native-tls", "stream"]}
-uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21.0", features = ["native-tls", "stream"]}
+uuid = { version = "1.8.0", features = ["v4"] }
+tokio = { version = "1.37.0", features = ["full"] }
 futures-channel = "0.3.30"
-reqwest = { version = "0.12", features = ["native-tls", "stream"]}
-bytes = "1"
+reqwest = { version = "0.12.4", features = ["native-tls", "stream"]}
+bytes = "1.6.0"
 futures-util = "0.3.30"
 log = "0.4.21"
 
 [dev-dependencies]
 env_logger = "0.11.3"
 native-tls = "0.2.11"
-
-[lib]
-crate-type = ["lib"]
 
 [[example]]
 name = "connector_test"
